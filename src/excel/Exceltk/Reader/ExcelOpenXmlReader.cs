@@ -224,6 +224,9 @@ namespace ExcelToolKit
             if (isRow)
             {
                 m_cellsValues = new object[sheet.ColumnsCount];
+                if (sheet.ColumnsCount>13) {
+                    int i = sheet.ColumnsCount;   
+                }
 
                 int rowIndex = int.Parse(m_xmlReader.GetAttribute(XlsxWorksheet.A_r));
                 if (rowIndex != (m_depth + 1))
@@ -365,6 +368,27 @@ namespace ExcelToolKit
                 return false;
             }
 
+            // Read Realtionship Table
+            //Console.WriteLine("sheetrel:{0}", sheet.Path);
+            var sheetRelStream = m_zipWorker.GetWorksheetRelsStream(sheet.Path);
+            var hyperDict = new Dictionary<string, string>();
+            if (sheetRelStream != null)
+            {
+                using (var reader = XmlReader.Create(sheetRelStream))
+                {
+                    while (reader.Read())
+                    {
+                        if (reader.NodeType == XmlNodeType.Element && reader.LocalName == XlsxWorkbook.N_rel)
+                        {
+                            string rid = reader.GetAttribute(XlsxWorkbook.A_id);
+                            hyperDict[rid] = reader.GetAttribute(XlsxWorkbook.A_target);
+                        }
+                    }
+                    sheetRelStream.Close();
+                }
+            }
+            
+
             // Read All HyperLink Node
             while (m_xmlReader.Read())
             {
@@ -372,7 +396,15 @@ namespace ExcelToolKit
                 if (m_xmlReader.LocalName != XlsxWorksheet.N_hyperlink) break;
                 string aref = m_xmlReader.GetAttribute(XlsxWorksheet.A_ref);
                 string display = m_xmlReader.GetAttribute(XlsxWorksheet.A_display);
+                string rid = m_xmlReader.GetAttribute(XlsxWorksheet.A_rid);
                 ////Console.WriteLine("{0}:{1}", aref.Substring(1), display);
+
+                //Console.WriteLine("hyperlink:{0}",hyperDict[rid]);
+                var hyperlink = display;
+                if (hyperDict.ContainsKey(rid))
+                {
+                    hyperlink = hyperDict[rid];
+                }
 
                 int col = -1;
                 int row = -1;
@@ -387,14 +419,14 @@ namespace ExcelToolKit
                         // TODO(fanfeilong):
                         var value = table.Columns[col].ColumnName;
                         XlsCell cell = new XlsCell(value);
-                        cell.SetHyperLink(display);
+                        cell.SetHyperLink(hyperlink);
                         table.Columns[col].DefaultValue = cell;
                     }
                     else
                     {
                         var value = table.Rows[row][col];
                         var cell = new XlsCell(value);
-                        cell.SetHyperLink(display);
+                        cell.SetHyperLink(hyperlink);
                         //Console.WriteLine(cell.MarkDownText);
                         table.Rows[row][col] = cell;
                     }
@@ -458,78 +490,119 @@ namespace ExcelToolKit
 			return AsDataSet(true);
 		}
 
-		public System.Data.DataSet AsDataSet(bool convertOADateTime)
-		{
-			if (!m_isValid) return null;
+		public System.Data.DataSet AsDataSet(bool convertOADateTime) {
+            if (!m_isValid) {
+                return null;
+            } else {
+                return ReadDataSet();
+            }
+		}
 
-			DataSet dataset = new DataSet();
+        private Dictionary<int,XlsxDimension> DetectDemension() {
+            var dict=new Dictionary<int, XlsxDimension>();
+            for (int sheetIndex=0; sheetIndex<m_workbook.Sheets.Count; sheetIndex++) {
+                var sheet=m_workbook.Sheets[sheetIndex];
+                
+                ReadSheetGlobals(sheet);
 
-			for (int sheetIndex = 0; sheetIndex < m_workbook.Sheets.Count; sheetIndex++)
-			{
-				DataTable table = new DataTable(m_workbook.Sheets[sheetIndex].Name);
+                if (sheet.Dimension!=null) {
+                    m_depth=0;
+                    m_emptyRowCount=0;
 
-				ReadSheetGlobals(m_workbook.Sheets[sheetIndex]);
+                    // 检测100行
+                    int detectRows=Math.Min(sheet.Dimension.LastRow, 100);
+                    int maxColumnCount=0;
+                    while (detectRows>0) {
+                        ReadSheetRow(sheet);
+                        maxColumnCount=Math.Max(LastIndexOfNonNull(m_cellsValues)+1, maxColumnCount);
+                        detectRows--;
+                    }
 
-				if (m_workbook.Sheets[sheetIndex].Dimension == null) continue;
+                    // 如果实际检测出来的列个数小于元数据里的列数，
+                    if (maxColumnCount<sheet.Dimension.LastCol) {
+                        dict[sheetIndex]=new XlsxDimension(sheet.Dimension.LastRow, maxColumnCount);
+                    } else {
+                        dict[sheetIndex]=sheet.Dimension;
+                    }
+                } else {
+                    dict[sheetIndex]=sheet.Dimension;
+                }
+            }
+            return dict;
+        }
 
-				m_depth = 0;
-				m_emptyRowCount = 0;
+        private int LastIndexOfNonNull(object[] cellsValues) {
+            for (int i=cellsValues.Length-1; i>=0; i--) {
+                if (cellsValues[i]!=null) {
+                    return i;    
+                }
+            }
+            return 0;
+        }
 
-				// Reada Columns
+
+        private System.Data.DataSet ReadDataSet() {
+            DataSet dataset=new DataSet();
+
+            var demensionDict=DetectDemension();
+
+            for (int sheetIndex=0; sheetIndex<m_workbook.Sheets.Count; sheetIndex++) {
+                var sheet=m_workbook.Sheets[sheetIndex];
+                var table=new DataTable(m_workbook.Sheets[sheetIndex].Name);
+                
+                ReadSheetGlobals(sheet);
+                sheet.Dimension=demensionDict[sheetIndex];
+
+                if (sheet.Dimension==null) {
+                    continue;
+                }
+
+                m_depth=0;
+                m_emptyRowCount=0;
+
+                // Reada Columns
                 //Console.WriteLine("Read Columns");
-				if (!m_isFirstRowAsColumnNames)
-				{
+                if (!m_isFirstRowAsColumnNames) {
                     // No Sheet Columns
-					for (int i = 0; i < m_workbook.Sheets[sheetIndex].ColumnsCount; i++)
-					{
+                    //Console.WriteLine("SheetName:{0}, ColumnCount:{1}", sheet.Name, sheet.ColumnsCount);
+                    for (int i=0; i<sheet.ColumnsCount; i++) {
                         table.Columns.Add(null, typeof(Object));
-					}
-				}
-                else if (ReadSheetRow(m_workbook.Sheets[sheetIndex]))
-                {
+                    }
+                } else if (ReadSheetRow(sheet)) {
                     // Read Sheet Columns
                     //Console.WriteLine("Read Sheet Columns");
-                    for (int index = 0; index < m_cellsValues.Length; index++)
-                    {
-                        if (m_cellsValues[index] != null && m_cellsValues[index].ToString().Length > 0)
-                        {
+                    for (int index=0; index<m_cellsValues.Length; index++) {
+                        if (m_cellsValues[index]!=null&&m_cellsValues[index].ToString().Length>0) {
                             table.AddColumnHandleDuplicate(m_cellsValues[index].ToString());
-                        }
-                        else
-                        {
+                        } else {
                             table.AddColumnHandleDuplicate(string.Concat(COLUMN, index));
                         }
                     }
-                }
-                else
-                {
+                } else {
                     continue;
                 }
 
                 // Read Sheet Rows
                 //Console.WriteLine("Read Sheet Rows");
                 table.BeginLoadData();
-                var sheet = m_workbook.Sheets[sheetIndex];
                 //Console.WriteLine("SheetIndex Is:{0},Name:{1}",sheetIndex,sheet.Name);
-				while (ReadSheetRow(sheet))
-				{
-					table.Rows.Add(m_cellsValues);
-				}
-                if (table.Rows.Count > 0)
-                {
+                while (ReadSheetRow(sheet)) {
+                    table.Rows.Add(m_cellsValues);
+                }
+                if (table.Rows.Count>0) {
                     dataset.Tables.Add(table);
                 }
 
                 // Read HyperLinks
                 //Console.WriteLine("Read Sheet HyperLinks:{0}",table.Rows.Count);
-                ReadHyperLinks(m_workbook.Sheets[sheetIndex],table);
+                ReadHyperLinks(sheet, table);
 
                 table.EndLoadData();
-			}
+            }
             dataset.AcceptChanges();
             dataset.FixDataTypes();
-			return dataset;
-		}
+            return dataset;
+        }
 
 		public bool IsFirstRowAsColumnNames
 		{
